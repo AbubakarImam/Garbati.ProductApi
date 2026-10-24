@@ -144,3 +144,92 @@ real caller this service expects in v1.
   `OrchestratorApi`'s side, not started by this task.
 - **The reconciliation job** `ARCHITECTURE.md` already flags ("a reconciliation job should compare posted
   fees with ProductApi's rules") — meaningless until real fee rules exist; not designed here.
+
+## Appendix A. T-045 build notes (foundation: project skeleton, 5 entities, 5 endpoints, migrations)
+
+Built everything in this document's v1 scope in one task, on `feature/productapi-foundation`, mirroring
+`Garbati.StaffIdentityApi`'s scaffold exactly (the simplest sibling service — calls nothing else, same as
+this one) for every cross-cutting concern: `global.json`/`dotnet-tools.json`, `.gitignore`/`.dockerignore`,
+the two-project `.sln`, the four-stage `Dockerfile`, and `ci.yml`'s `test`+`docker` jobs (no `deploy` job
+yet, matching how every sibling service started). The judgment calls this task made, beyond what Sections
+1-5 above already pin down:
+
+1. **`POST /v1/products` has no idempotency key; `POST /v1/account-bindings` does.** Task file's own
+   framing, taken at face value: product creation is a rarer, ops-driven catalog action, not the
+   "literal create-a-new-thing shape every other idempotent-create endpoint on this platform uses" —
+   the 409-on-duplicate-currently-effective-row check already stops the obvious double-create failure
+   mode without one. Binding an account to a product is exactly that literal shape (it's the thing
+   `OrchestratorApi`'s account-opening step 5 will retry on a resumed operation), so it gets the full
+   client-scoped idempotency-key treatment `StaffUser`/`Customer`/`AccountOpening` all already use.
+2. **`Product` is effective-dated, and "currently effective" is enforced two ways.** A partial unique
+   index on `(product_code)` filtered to `effective_to IS NULL` is the database-level half (mirrors
+   `Garbati.IdentityApi`'s own partial-unique-index idiom for `Mandate`, filtered on a state marker for
+   the same reason a Postgres index can't filter on `now()`); `ProductService`'s own check in
+   application code additionally catches the rarer case of an existing row whose `EffectiveTo` is set
+   but still in the future. Both paths throw the same `DuplicateProductCodeException` → 409.
+3. **`AccountProductBinding.AccountNumber` is unique — one binding per account in v1.** `docs/DESIGN.md`
+   Section 3's own wording for the GET endpoint ("which product **(if any)** an account is bound to") is
+   singular, and nothing in this task's scope describes a re-binding flow that would make multiple
+   historical bindings per account meaningful yet. A second bind attempt against an already-bound
+   account, under a *different* idempotency key than the one that created it, is a new
+   `AccountAlreadyBoundException` → 409 — not explicitly specified, but the only reading consistent with
+   "every create-something-new endpoint returns 409 on a real conflict" (`ARCHITECTURE.md` Section 5)
+   rather than letting an unhandled `DbUpdateException` surface as a 500.
+4. **Distinguishing "idempotent replay" from "genuine conflict" does not rely on which unique constraint
+   Postgres reports first.** A retry with the same idempotency key and the same account number violates
+   *both* of `AccountProductBinding`'s unique indexes at once, and Postgres does not guarantee it reports
+   the idempotency-key one first. `AccountProductBindingService.CreateAsync` checks for an existing
+   `(CreatedByClientId, IdempotencyKey)` match FIRST, inside the catch block, regardless of which
+   constraint actually fired — only when no such match exists does the account-number constraint mean
+   what it's named for (a different key colliding with an already-bound account). Caught by this
+   service's own `CreateAccountBinding_RetryWithTheSameKeyAndBody_ReturnsTheSameBinding` test during
+   development: it initially returned 409 instead of replaying the original 200.
+5. **`FeeQuoteResponse`'s `FeeResult` vocabulary (`NoFeeConfigured`/`FeeApplied`) is this task's own
+   naming** — `docs/DESIGN.md` names the first value in prose but not the second. `FeeApplied` marks the
+   "a real `FeeRule` row was found and a fee was computed" branch that the task file explicitly invited
+   building "for completeness" — it is real, reachable code, but no migration in this repository and no
+   test anywhere ever inserts a row that branch could read. See `FeeQuoteService`'s own class comment for
+   why this is not the same thing as deciding a real fee rule.
+6. **`ProductAuditLog` is one generic table, not a per-entity shape like `StaffAuditLog`.** This service
+   audits two different entity types (`Product`, `AccountProductBinding`) from day one, so the
+   `EntityType`/`EntityId` generic shape `Garbati.IdentityApi.Entities.AuditEvent` already uses was the
+   closer precedent to copy than `StaffIdentityApi`'s single-entity-type `StaffAuditLog`.
+7. **Test strategy: controller-level (HTTP), against the real app and a real Testcontainers Postgres,
+   nothing mocked.** Same reasoning as `StaffIdentityApi`'s own build notes: this service calls nothing
+   downstream (`docs/DESIGN.md` Section 1), so there is no `Clients/`-style fake to maintain. The two
+   tests the task file calls out by name as non-negotiable —
+   `FeeRulesTable_IsProvablyEmpty_AfterMigration` and `ProfitSharingTermsTable_IsProvablyEmpty_
+   AfterMigration` in `Data/MigrationTests.cs` — run a real `SELECT count(*)` against the migrated
+   database, not an assumption that "no migration seeds it" is good enough.
+8. **Two QA Should-fix findings on PR #1, resolved on the same branch before merge:**
+   - **Coverage gap closed:** item 3 above (`AccountAlreadyBoundException` → 409, a *different*
+     idempotency key colliding with `AccountNumber` alone, not a replay) depended on the hardcoded
+     constraint-name string `ix_account_product_bindings_account_number` actually matching what
+     Postgres reports, and had no test. `AccountBindingsControllerTests.
+     CreateAccountBinding_DifferentKey_SameAccountAlreadyBoundToAnotherProduct_Returns409` now exercises
+     it directly over real HTTP, asserting the 409 status, the `ProblemDetails` title/detail text, and
+     that the original binding is unchanged - not just "not 200."
+   - **Defensive-coding inconsistency fixed:** `ProductService.CreateAsync`'s `catch (DbUpdateException)`
+     had no Postgres-error-code guard, unlike `AccountProductBindingService.CreateAsync`'s precise
+     `when (ex.InnerException is PostgresException { SqlState: "23505" })`. Made them match - only a
+     real unique-constraint collision becomes `DuplicateProductCodeException` → 409; any other
+     `DbUpdateException` (a transient connection failure, say) now propagates as itself, which the
+     generic exception handler correctly maps to 500. Proving this against a real, different
+     `DbUpdateException` on live Postgres on demand isn't practical, so
+     `Services/ProductServiceTests.cs` proves the guard at the service level instead: a `ProductDbContext`
+     subclass (`ThrowingOnSaveProductDbContext`) that always throws a `DbUpdateException` whose
+     `InnerException` is deliberately not a `PostgresException` at all from `SaveChangesAsync`, run
+     against this fixture's own real, already-migrated Testcontainers Postgres for everything up to that
+     point (no new package dependency, no second database provider - only the save itself is faked).
+9. **Found while re-running the suite after item 8: an intermittent CI-only test failure, fixed at the
+   root cause.** `CreateAccountBinding_RetryWithTheSameKeyAndBody_ReturnsTheSameBinding` compares
+   `BoundAt` between the original create response (an in-memory value, never re-read from the database)
+   and the idempotent-replay response (read back from the database). Postgres `timestamp with time zone`
+   stores microsecond precision; a .NET `DateTimeOffset` tick is 100ns - so the two values could differ
+   by a few hundred nanoseconds, passing locally almost always but failing intermittently on GitHub's CI
+   runner. Fixed by truncating `BoundAt` to microsecond precision at the moment of creation
+   (`AccountProductBindingService.TruncateToMicroseconds`), so the in-memory value already matches what
+   the database will store and a replay always reads back the exact same value.
+
+See the PR description for how this was tested, the exact passing test count, what could not be
+verified, and the full LEARNING_LOG entry.
