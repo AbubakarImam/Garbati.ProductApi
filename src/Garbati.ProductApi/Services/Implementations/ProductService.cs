@@ -6,6 +6,7 @@ using Garbati.ProductApi.Entities;
 using Garbati.ProductApi.Exceptions;
 using Garbati.ProductApi.Services.Interfaces;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace Garbati.ProductApi.Services.Implementations;
 
@@ -60,7 +61,12 @@ public class ProductService(ProductDbContext dbContext, IProductAuditLogger audi
         {
             await dbContext.SaveChangesAsync(cancellationToken);
         }
-        catch (DbUpdateException)
+        // QA Should-fix #2: guard on the actual Postgres unique-violation error code, the same precise
+        // pattern AccountProductBindingService.CreateAsync already uses - a DbUpdateException that is NOT
+        // the partial unique index firing (e.g. a transient connection failure) must propagate as the
+        // generic 500 it actually is, not get misreported as a 409 just because *some* DbUpdateException
+        // happened during this save.
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: "23505" })
         {
             // The partial unique index fired - a concurrent request won the race. Same conflict, same 409.
             throw new DuplicateProductCodeException(

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Garbati.ProductApi.Authorization;
 using Garbati.ProductApi.Contracts.Responses;
 using Garbati.ProductApi.Tests.Fixtures;
@@ -96,6 +97,50 @@ public class AccountBindingsControllerTests(ApiFixture fixture) : IAsyncLifetime
         });
 
         Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+    }
+
+    // QA Should-fix #1: the third branch AccountProductBindingService.CreateAsync's constraint-name
+    // check creates - a DIFFERENT idempotency key colliding on AccountNumber alone (not a replay of the
+    // same binding) - had no test anywhere. This exercises it directly: bind an account to product A,
+    // then attempt to bind the SAME account number to a different product B under a brand-new
+    // idempotency key, and assert the real 409/AccountAlreadyBoundException shape, not just "not 200".
+    // This is the path that depends on the hardcoded ix_account_product_bindings_account_number
+    // constraint name actually matching what Postgres reports - if that ever drifts, this test (not just
+    // "not 200") is what would catch it falling through to the bare `throw;` and surfacing as a 500.
+    [Fact]
+    public async Task CreateAccountBinding_DifferentKey_SameAccountAlreadyBoundToAnotherProduct_Returns409()
+    {
+        using var writeClient = CatalogWriteClient();
+        var productA = await ProductApiHelpers.CreateProductAsync(writeClient);
+        var productB = await ProductApiHelpers.CreateProductAsync(writeClient);
+        var accountNumber = $"ACC-{Guid.NewGuid():N}"[..20];
+
+        using var first = await writeClient.PostAsJsonAsync("/v1/account-bindings", new
+        {
+            idempotencyKey = $"bind-first-{Guid.NewGuid():N}",
+            accountNumber,
+            productCode = productA.ProductCode,
+        });
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+
+        using var second = await writeClient.PostAsJsonAsync("/v1/account-bindings", new
+        {
+            idempotencyKey = $"bind-second-{Guid.NewGuid():N}", // brand-new key - NOT a replay
+            accountNumber, // same account number as the binding above
+            productCode = productB.ProductCode,
+        });
+
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+        Assert.Equal("application/problem+json", second.Content.Headers.ContentType?.MediaType);
+
+        using var problem = JsonDocument.Parse(await second.Content.ReadAsStringAsync());
+        Assert.Equal("This account is already bound to a product.", problem.RootElement.GetProperty("title").GetString());
+        Assert.Contains(accountNumber, problem.RootElement.GetProperty("detail").GetString());
+
+        // Still bound to the original product - the rejected second call changed nothing.
+        await using var ctx = fixture.CreateContext();
+        var binding = await ctx.AccountProductBindings.AsNoTracking().SingleAsync(b => b.AccountNumber == accountNumber);
+        Assert.Equal(productA.ProductCode, binding.ProductCode);
     }
 
     // Task file: "404 for an unknown ProductCode."

@@ -70,14 +70,16 @@ public class ApiFixture : IAsyncLifetime
         });
     }
 
-    public ProductDbContext CreateContext()
-    {
-        var options = new DbContextOptionsBuilder<ProductDbContext>()
+    public ProductDbContext CreateContext() => new(CreateOptions());
+
+    // Exposed so a test can build a DbContext SUBCLASS against this same real, already-migrated
+    // database (e.g. Services/ProductServiceTests.cs's throwing-on-save test double) without needing a
+    // second database provider or any new package dependency.
+    public DbContextOptions<ProductDbContext> CreateOptions() =>
+        new DbContextOptionsBuilder<ProductDbContext>()
             .UseNpgsql(_container.GetConnectionString())
             .UseSnakeCaseNamingConvention()
             .Options;
-        return new ProductDbContext(options);
-    }
 
     // An HTTP client for the in-memory app, sending the given client's key (or no key when null).
     public HttpClient CreateClient(string? clientId)

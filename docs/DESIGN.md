@@ -201,6 +201,26 @@ yet, matching how every sibling service started). The judgment calls this task m
    `FeeRulesTable_IsProvablyEmpty_AfterMigration` and `ProfitSharingTermsTable_IsProvablyEmpty_
    AfterMigration` in `Data/MigrationTests.cs` — run a real `SELECT count(*)` against the migrated
    database, not an assumption that "no migration seeds it" is good enough.
+8. **Two QA Should-fix findings on PR #1, resolved on the same branch before merge:**
+   - **Coverage gap closed:** item 3 above (`AccountAlreadyBoundException` → 409, a *different*
+     idempotency key colliding with `AccountNumber` alone, not a replay) depended on the hardcoded
+     constraint-name string `ix_account_product_bindings_account_number` actually matching what
+     Postgres reports, and had no test. `AccountBindingsControllerTests.
+     CreateAccountBinding_DifferentKey_SameAccountAlreadyBoundToAnotherProduct_Returns409` now exercises
+     it directly over real HTTP, asserting the 409 status, the `ProblemDetails` title/detail text, and
+     that the original binding is unchanged - not just "not 200."
+   - **Defensive-coding inconsistency fixed:** `ProductService.CreateAsync`'s `catch (DbUpdateException)`
+     had no Postgres-error-code guard, unlike `AccountProductBindingService.CreateAsync`'s precise
+     `when (ex.InnerException is PostgresException { SqlState: "23505" })`. Made them match - only a
+     real unique-constraint collision becomes `DuplicateProductCodeException` → 409; any other
+     `DbUpdateException` (a transient connection failure, say) now propagates as itself, which the
+     generic exception handler correctly maps to 500. Proving this against a real, different
+     `DbUpdateException` on live Postgres on demand isn't practical, so
+     `Services/ProductServiceTests.cs` proves the guard at the service level instead: a `ProductDbContext`
+     subclass (`ThrowingOnSaveProductDbContext`) that always throws a `DbUpdateException` whose
+     `InnerException` is deliberately not a `PostgresException` at all from `SaveChangesAsync`, run
+     against this fixture's own real, already-migrated Testcontainers Postgres for everything up to that
+     point (no new package dependency, no second database provider - only the save itself is faked).
 
 See the PR description for how this was tested, the exact passing test count, what could not be
 verified, and the full LEARNING_LOG entry.
