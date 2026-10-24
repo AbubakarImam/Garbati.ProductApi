@@ -38,6 +38,16 @@ public class AccountProductBindingService(
     private static AccountProductBindingResponse ToResponse(AccountProductBinding binding) =>
         new(binding.AccountNumber, binding.ProductCode, binding.BoundAt);
 
+    // Postgres "timestamp with time zone" stores microsecond precision (6 fractional digits); a .NET
+    // DateTimeOffset tick is 100ns (7 fractional digits, 10 ticks per microsecond). Without this, the
+    // value returned on the ORIGINAL create call (kept in memory, never re-read from the database) can
+    // differ from the value returned on an idempotent REPLAY (read back from the database, which has
+    // already truncated it) by a few hundred nanoseconds - an intermittent CI failure
+    // (CreateAccountBinding_RetryWithTheSameKeyAndBody_ReturnsTheSameBinding) caught this. Truncating at
+    // the moment of creation means both calls return the exact same value every time.
+    private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value) =>
+        new(value.Ticks - value.Ticks % TimeSpan.TicksPerMicrosecond, value.Offset);
+
     public async Task<AccountProductBindingResponse> CreateAsync(CreateAccountProductBindingRequest request, CancellationToken cancellationToken = default)
     {
         // DESIGN.md Section 3, endpoint 3: "404 if ProductCode doesn't exist." This service never calls
@@ -55,7 +65,7 @@ public class AccountProductBindingService(
         {
             AccountNumber = request.AccountNumber,
             ProductCode = request.ProductCode,
-            BoundAt = DateTimeOffset.UtcNow,
+            BoundAt = TruncateToMicroseconds(DateTimeOffset.UtcNow),
             IdempotencyKey = request.IdempotencyKey,
             CreatedByClientId = clientId,
             RequestHash = requestHash,

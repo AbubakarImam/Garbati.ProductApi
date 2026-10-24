@@ -221,6 +221,15 @@ yet, matching how every sibling service started). The judgment calls this task m
      `InnerException` is deliberately not a `PostgresException` at all from `SaveChangesAsync`, run
      against this fixture's own real, already-migrated Testcontainers Postgres for everything up to that
      point (no new package dependency, no second database provider - only the save itself is faked).
+9. **Found while re-running the suite after item 8: an intermittent CI-only test failure, fixed at the
+   root cause.** `CreateAccountBinding_RetryWithTheSameKeyAndBody_ReturnsTheSameBinding` compares
+   `BoundAt` between the original create response (an in-memory value, never re-read from the database)
+   and the idempotent-replay response (read back from the database). Postgres `timestamp with time zone`
+   stores microsecond precision; a .NET `DateTimeOffset` tick is 100ns - so the two values could differ
+   by a few hundred nanoseconds, passing locally almost always but failing intermittently on GitHub's CI
+   runner. Fixed by truncating `BoundAt` to microsecond precision at the moment of creation
+   (`AccountProductBindingService.TruncateToMicroseconds`), so the in-memory value already matches what
+   the database will store and a replay always reads back the exact same value.
 
 See the PR description for how this was tested, the exact passing test count, what could not be
 verified, and the full LEARNING_LOG entry.
